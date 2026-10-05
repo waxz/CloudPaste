@@ -1,0 +1,121 @@
+name: Verify Cloudflare Token[校验CF令牌]
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-token:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CF_API: https://api.cloudflare.com/client/v4
+    steps:
+      - name: 🔑 检查 Secrets 是否已配置
+        run: |
+          MISSING=0
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "❌ 缺少 GitHub Secret: CLOUDFLARE_API_TOKEN"
+            MISSING=1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "❌ 缺少 GitHub Secret: CLOUDFLARE_ACCOUNT_ID"
+            MISSING=1
+          fi
+          if [ "$MISSING" = "1" ]; then
+            echo "请在 Settings → Secrets and variables → Actions 中添加上述 Secret"
+            exit 1
+          fi
+
+          # 常见问题：复制时带入了空白字符
+          if [[ "$CLOUDFLARE_API_TOKEN" =~ [[:space:]] ]]; then
+            echo "❌ CLOUDFLARE_API_TOKEN 中包含空格或换行，请重新复制"
+            exit 1
+          fi
+          if ! [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "❌ CLOUDFLARE_ACCOUNT_ID 格式不正确（应为 32 位十六进制字符串）"
+            exit 1
+          fi
+          echo "✅ Secrets 已配置"
+
+      - name: 🔍 校验令牌及权限
+        run: |
+          FAILED=0
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          echo "## Cloudflare 令牌校验结果" >> "$SUMMARY"
+          echo "" >> "$SUMMARY"
+          echo "| 检查项 | 结果 | 说明 |" >> "$SUMMARY"
+          echo "| --- | --- | --- |" >> "$SUMMARY"
+
+          # 调用 API，返回 JSON；网络错误时返回空对象
+          cf_get() {
+            curl -sS --max-time 30 \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "$CF_API$1" || echo '{}'
+          }
+
+          # 提取 API 错误信息
+          cf_errors() {
+            echo "$1" | jq -r '[.errors[]? | "[\(.code)] \(.message)"] | join("; ")' 2>/dev/null || echo "无法解析响应"
+          }
+
+          # check <名称> <API 路径> <失败提示>
+          check() {
+            local name="$1" path="$2" hint="$3"
+            local resp
+            resp=$(cf_get "$path")
+            if [ "$(echo "$resp" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
+              echo "✅ $name"
+              echo "| $name | ✅ | - |" >> "$SUMMARY"
+              return 0
+            fi
+            local err
+            err=$(cf_errors "$resp")
+            echo "❌ $name: $err"
+            echo "   👉 $hint"
+            echo "| $name | ❌ | $err — $hint |" >> "$SUMMARY"
+            FAILED=1
+            return 1
+          }
+
+          # 1) 令牌有效性：用户令牌与账户令牌使用不同的校验接口
+          RESP=$(cf_get "/user/tokens/verify")
+          if [ "$(echo "$RESP" | jq -r '.success // false' 2>/dev/null)" != "true" ]; then
+            RESP=$(cf_get "/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify")
+          fi
+          STATUS=$(echo "$RESP" | jq -r '.result.status // empty' 2>/dev/null)
+          EXPIRES=$(echo "$RESP" | jq -r '.result.expires_on // "永不过期"' 2>/dev/null)
+          if [ "$STATUS" = "active" ]; then
+            echo "✅ 令牌有效 (status: active, 过期时间: $EXPIRES)"
+            echo "| 令牌有效性 | ✅ | 过期时间: $EXPIRES |" >> "$SUMMARY"
+          else
+            ERR=$(cf_errors "$RESP")
+            echo "❌ 令牌无效: status=${STATUS:-unknown} $ERR"
+            echo "   👉 令牌可能已过期、被吊销或复制错误，请在 Cloudflare 控制台重新创建"
+            echo "| 令牌有效性 | ❌ | status=${STATUS:-unknown} $ERR |" >> "$SUMMARY"
+            exit 1
+          fi
+
+          # 2) 账户访问
+          check "账户访问" "/accounts/$CLOUDFLARE_ACCOUNT_ID" \
+            "令牌无权访问该账户，请确认 CLOUDFLARE_ACCOUNT_ID 正确，且令牌的 Account Resources 包含该账户" || true
+
+          # 3) D1 数据库（部署时需要 D1:Edit）
+          check "D1 数据库读取" "/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?per_page=1" \
+            "请为令牌添加 Account → D1 → Edit 权限" || true
+
+          # 4) Workers 脚本（部署时需要 Workers Scripts:Edit）
+          check "Workers 脚本读取" "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" \
+            "请为令牌添加 Account → Workers Scripts → Edit 权限" || true
+
+          echo "" >> "$SUMMARY"
+          echo "> 注：读取检查通过不代表一定具有 Edit 权限，部署仍需 D1:Edit 与 Workers Scripts:Edit。" >> "$SUMMARY"
+
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "❌ 令牌校验未通过，详见上方说明或 Job Summary"
+            exit 1
+          fi
+          echo ""
+          echo "✅ 令牌校验全部通过"
