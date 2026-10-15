@@ -449,7 +449,7 @@ export class GithubApiStorageDriver extends BaseDriver {
     const { path: fsPath, filename, contentLength, mount } = ctx;
 
     const normalizedSubPath = this._normalizeSubPath(subPath);
-    const targetSubPath = this._resolveTargetSubPath(normalizedSubPath, fsPath, filename);
+    const targetSubPath = this._resolveTargetSubPath(normalizedSubPath, fsPath, filename, subPath);
     const repoRelPath = this._toRepoRelPath(targetSubPath);
 
     // 上传：优先走“边读边写”的 blob 创建，降低内存峰值
@@ -1648,19 +1648,26 @@ export class GithubApiStorageDriver extends BaseDriver {
     return segs.length ? segs[segs.length - 1] : "";
   }
 
-  _resolveTargetSubPath(subPath, fsPath, filename) {
+  _resolveTargetSubPath(subPath, fsPath, filename, rawSubPath = subPath) {
     const sp = this._normalizeSubPath(subPath);
     const name = filename || null;
 
-    // 后端 /api/fs/upload（流式与表单）默认将 path 作为“目标目录”，文件名通过 filename 传入
-    // 因此只要带 filename，就一律按“目录 + 文件名”语义拼接
-    if (name) {
-      const base = sp === "/" ? "" : sp.replace(/\/+$/, "");
-      return `${base}/${name}`.replace(/\/+/g, "/");
-    }
-
     // 无 filename：认为 subPath 已是完整文件路径
-    return sp;
+    if (!name) return sp;
+
+    // /api/fs/upload（流式与表单）将 path 作为“目标目录”，文件名通过 filename 传入，需要拼接。
+    // 但 WebDAV PUT 与跨存储复制传入的是完整文件路径（且 filename 就是最后一段），
+    // 此时不能再拼接，否则会写成 a.png/a.png。与 S3 / OneDrive / Google Drive 驱动的判断一致：
+    // 只有路径明确是目录（以 / 结尾），或最后一段不是该文件名时，才拼接文件名。
+    // The upload API passes a directory plus `filename`, which must be joined. WebDAV PUT
+    // and cross-storage copies pass the full file path, whose last segment already is
+    // `filename`; joining again would store a.png as a.png/a.png.
+    const markedAsDirectory = String(rawSubPath ?? "").endsWith("/") || String(fsPath ?? "").endsWith("/");
+    const leaf = sp.split("/").filter(Boolean).pop() || "";
+    if (!markedAsDirectory && leaf === name) return sp;
+
+    const base = sp === "/" ? "" : sp.replace(/\/+$/, "");
+    return `${base}/${name}`.replace(/\/+/g, "/");
   }
 
   async _readAllBytes(input) {
